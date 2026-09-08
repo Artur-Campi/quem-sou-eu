@@ -195,6 +195,8 @@ function subscribe(code) {
   unsubscribe = onValue(
     roomRef(code),
     (snap) => {
+      window.__SUBLOG = window.__SUBLOG || [];
+      window.__SUBLOG.push({ t: Date.now(), exists: snap.exists(), val: snap.val() ? "tem-dado" : "NULO", codeAntes: S.code });
       S.offline = false;
       S.room = normalize(snap.val());
       if (!S.room) { S.code = ""; saveMe({ ...(loadMe() || {}), code: "" }); }
