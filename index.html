@@ -683,7 +683,7 @@ window.addEventListener("error", () => { S.error = "Deu um soluço aqui. A parti
     S.me = { id: saved.id, name: "" };
   }
   render(true);
-})();
-</script>
+  window.__DEBUG = { S, draft, db: () => db };
+})();</script>
 </body>
 </html>
