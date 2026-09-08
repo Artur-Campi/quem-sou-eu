@@ -678,9 +678,9 @@ window.addEventListener("error", () => { S.error = "Deu um soluço aqui. A parti
   }
   const saved = loadMe();
   if (saved && saved.id) {
-    S.me = { id: saved.id, name: saved.name || "" };
-    draft.name = saved.name || "";
-    if (saved.code && db) { S.code = saved.code; subscribe(saved.code); }
+    // Mantem o mesmo id (para o host ser reconhecido se digitar o mesmo codigo de novo),
+    // mas nao reabre a sala nem preenche o nome sozinho: a pessoa sempre comeca do zero.
+    S.me = { id: saved.id, name: "" };
   }
   render(true);
 })();
