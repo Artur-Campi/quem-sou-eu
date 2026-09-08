@@ -178,7 +178,7 @@ async function mutate(mutator) {
   try {
     await runTransaction(roomRef(S.code), (current) => {
       const room = normalize(current);
-      if (!room) return; // aborta a transacao em vez de apagar a sala
+      if (!room) return current; // sem cache local ainda: propoe nao mudar nada, o SDK tenta de novo com o dado real do servidor
       const next = mutator(room);
       return next || room;
     });
