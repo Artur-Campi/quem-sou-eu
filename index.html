@@ -192,6 +192,708 @@ async function mutate(mutator) {
 function subscribe(code) {
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
   if (!code) return;
+  let sawData = false;
+  unsubscribe = onValue(
+    roomRef(code),
+    (snap) => {
+      S.offline = false;
+      const room = normalize(snap.val());
+      if (room) {
+        // dado real chegou: garante que o codigo da sala nunca fique fora de sincronia
+        sawData = true;
+        S.room = room;
+        S.code = code;
+      } else if (sawData) {
+        // sala existia e agora nao existe mais: foi mesmo apagada
+        S.room = null;
+        S.code = "";
+        saveMe({ ...(loadMe() || {}), code: "" });
+      } else {
+        // primeiro instantaneo vazio (cache local ainda frio) - ignora e espera o proximo
+        S.room = null;
+      }
+      render();
+    },
+    () => { S.offline = true; render(true); }
+  );
+}
+
+/* ---------- acoes ---------- */
+async function createRoom() {
+  const name = draft.name.trim();
+  if (!name) return fail("Escreve seu nome primeiro.");
+  const id = (S.me && S.me.id) || "p" + Math.random().toString(36).slice(2, 10);
+  let code = randomCode();
+  for (let i = 0; i < 5; i++) {
+    const snap = await get(roomRef(code));
+    if (!snap.exists()) break;
+    code = randomCode();
+  }
+  const room = {
+    code, phase: "lobby", hostId: id, round: 1, turn: 0, pending: null,
+    players: [{ id, name, character: "", hint: "", solved: false, place: 0 }],
+    log: [{ t: Date.now(), text: "Sala criada." }], createdAt: Date.now()
+  };
+  await set(roomRef(code), room);
+  S.me = { id, name }; S.code = code; S.room = room;
+  saveMe({ id, name, code });
+  subscribe(code);
+  render(true);
+}
+
+async function joinRoom() {
+  const name = draft.name.trim();
+  const code = draft.code.trim().toUpperCase();
+  if (!name) return fail("Escreve seu nome primeiro.");
+  if (code.length < 4) return fail("O código tem 4 letras.");
+  const snap = await get(roomRef(code));
+  const room = normalize(snap.val());
+  if (!room) return fail("Não achei essa sala. Confere o código com quem criou.");
+  const id = (S.me && S.me.id) || "p" + Math.random().toString(36).slice(2, 10);
+  const already = room.players.some((p) => p.id === id);
+  if (!already && room.phase !== "lobby") return fail("Esse jogo já começou. Peçam pra criar uma sala nova.");
+  if (!already && room.players.length >= 8) return fail("Essa sala já está com 8 jogadores.");
+  S.me = { id, name }; S.code = code;
+  saveMe({ id, name, code });
+  subscribe(code);
+  await mutate((r) => {
+    const i = r.players.findIndex((p) => p.id === id);
+    if (i >= 0) { r.players[i].name = name; return r; }
+    r.players.push({ id, name, character: "", hint: "", solved: false, place: 0 });
+    pushLog(r, name + " entrou na sala.");
+    return r;
+  });
+}
+
+const startGame = () => mutate((r) => {
+  if (r.players.length < 2) { S.error = "Precisa de pelo menos 2 jogadores."; return r; }
+  r.phase = "assign"; r.turn = 0; r.pending = null;
+  r.players = r.players.map((p) => ({ ...p, character: "", hint: "", solved: false, place: 0 }));
+  r.log = [{ t: Date.now(), text: "Cada um escreve em segredo quem o próximo da lista vai ser." }];
+  return r;
+});
+
+function assignCharacter() {
+  const value = draft.char.trim();
+  if (!value) return fail("Escreve quem essa pessoa vai ser.");
+  const hint = draft.hint.trim();
+  draft.char = ""; draft.hint = "";
+  return mutate((r) => {
+    const i = r.players.findIndex((p) => p.id === S.me.id);
+    if (i < 0) return r;
+    const t = (i + r.round) % r.players.length;
+    r.players[t].character = value;
+    r.players[t].hint = hint;
+    pushLog(r, r.players[i].name + " já escolheu.");
+    if (r.players.every((p) => p.character)) {
+      r.phase = "playing"; r.turn = 0;
+      pushLog(r, "Todos os papéis estão na testa. Começou!");
+    }
+    return r;
+  });
+}
+
+const passTurn = () => mutate((r) => {
+  const i = r.players.findIndex((p) => p.id === S.me.id);
+  if (i < 0 || r.players[r.turn].id !== S.me.id) return r;
+  pushLog(r, r.players[i].name + " passou a vez.");
+  advanceTurn(r);
+  return r;
+});
+
+function sendGuess() {
+  const value = draft.guess.trim();
+  if (!value) return fail("Escreve seu chute.");
+  draft.guess = ""; S.guessOpen = false;
+  return mutate((r) => {
+    const i = r.players.findIndex((p) => p.id === S.me.id);
+    if (i < 0) return r;
+    r.pending = { by: S.me.id, name: r.players[i].name, text: value };
+    return r;
+  });
+}
+
+const judge = (correct) => mutate((r) => {
+  if (!r.pending) return r;
+  const guesserId = r.pending.by;
+  const guess = r.pending.text;
+  const gi = r.players.findIndex((p) => p.id === guesserId);
+  r.pending = null;
+  if (gi < 0) return r;
+  if (correct) {
+    r.players[gi].solved = true;
+    r.players[gi].place = r.players.filter((p) => p.solved).length;
+    pushLog(r, r.players[gi].name + " acertou: era " + r.players[gi].character + ".");
+    if (r.players.every((p) => p.solved)) { r.phase = "end"; return r; }
+  } else {
+    pushLog(r, r.players[gi].name + " chutou " + guess + " e errou.");
+  }
+  if (r.players[r.turn].id === guesserId) advanceTurn(r);
+  return r;
+});
+
+const cancelGuess = () => mutate((r) => { r.pending = null; return r; });
+
+const revealAll = () => mutate((r) => {
+  r.phase = "end"; r.pending = null;
+  pushLog(r, "O anfitrião revelou todos os papéis.");
+  return r;
+});
+
+const playAgain = () => mutate((r) => {
+  r.round = r.round + 1; r.phase = "assign"; r.turn = 0; r.pending = null;
+  r.players = r.players.map((p) => ({ ...p, character: "", hint: "", solved: false, place: 0 }));
+  r.log = [{ t: Date.now(), text: "Rodada " + r.round + ". Escolham papéis novos." }];
+  return r;
+});
+
+async function leaveRoom() {
+  const wasLobby = S.room && S.room.phase === "lobby";
+  const id = S.me ? S.me.id : null;
+  if (wasLobby && id) {
+    await mutate((r) => {
+      r.players = r.players.filter((p) => p.id !== id);
+      if (!r.players.length) return r;
+      if (r.hostId === id) r.hostId = r.players[0].id;
+      if (r.turn >= r.players.length) r.turn = 0;
+      return r;
+    });
+  }
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  S.code = ""; S.room = null; S.guessOpen = false;
+  saveMe({ ...(loadMe() || {}), code: "" });
+  render(true);
+}
+
+function copyInvite() {
+  const text = "Bora jogar Quem sou eu? Entra em " + location.href.split("#")[0] + " com o código " + S.code;
+  const done = () => { S.copied = true; render(true); setTimeout(() => { S.copied = false; render(true); }, 2200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fail("Não consegui copiar. Passa o código na mão mesmo."));
+  } else {
+    fail("Não consegui copiar. Passa o código na mão mesmo.");
+  }
+}
+
+/* ---------- telas ---------- */
+function viewSetup() {
+  return `
+    <div class="hero"><div class="note" style="--paper:${PAPERS[0]};transform:rotate(-2deg)">
+      <div class="hand title">Quase lá</div>
+      <div class="hand sub">falta ligar o banco de dados</div>
+    </div></div>
+    <div class="card stack">
+      <h3>Configuração em 4 passos</h3>
+      <ol class="setup">
+        <li>Entre em <a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a> e crie um projeto (pode recusar o Analytics).</li>
+        <li>No menu Criação, abra <b>Realtime Database</b>, clique em Criar banco de dados, escolha a região e o modo de teste.</li>
+        <li>Em Configurações do projeto, adicione um app da Web e copie o objeto <code>firebaseConfig</code>.</li>
+        <li>Cole esse objeto no topo do arquivo <code>index.html</code>, no lugar do <code>FIREBASE_CONFIG</code> vazio, e suba o arquivo de novo.</li>
+      </ol>
+      <p class="tiny">O campo <code>databaseURL</code> precisa estar preenchido. Se ele não aparecer no config, é porque o Realtime Database ainda não foi criado no passo 2.</p>
+    </div>`;
+}
+
+function viewHome() {
+  return `
+    <div class="hero"><div class="note" style="--paper:${PAPERS[0]};transform:rotate(-2deg)">
+      <div class="hand title">Quem sou eu?</div>
+      <div class="hand sub">todo mundo sabe, menos você</div>
+    </div></div>
+    <div class="card stack">
+      <label class="stack-sm">
+        <span class="muted">Seu nome</span>
+        <input class="field" id="f-name" data-draft="name" maxlength="16" placeholder="Artur" value="${esc(draft.name)}" />
+      </label>
+      <button class="btn btn-block" data-act="create">Criar uma sala</button>
+      <p class="tiny" style="text-align:center">ou entre na sala de alguém</p>
+      <div class="row">
+        <input class="field code-field" id="f-code" data-draft="code" style="flex:1 1 120px" maxlength="4" placeholder="ABCD" value="${esc(draft.code)}" />
+        <button class="btn btn-ghost" data-act="join">Entrar</button>
+      </div>
+      ${S.error ? `<p class="err">${esc(S.error)}</p>` : ""}
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px">Como funciona</h3>
+      <ul class="rules">
+        <li>Cada um escreve, em segredo, quem o próximo jogador da lista vai ser.</li>
+        <li>Você enxerga o papel de todo mundo, menos o seu.</li>
+        <li>Na sua vez, faça uma pergunta de sim ou não em voz alta na chamada.</li>
+        <li>Achou que sabe? Chuta, e os outros confirmam.</li>
+      </ul>
+    </div>`;
+}
+
+function viewLobby(room, me) {
+  const host = room.players.find((p) => p.id === room.hostId);
+  const isHost = room.hostId === me.id;
+  return `
+    <div class="stack-sm">
+      <h1 style="font-size:26px">Sala aberta</h1>
+      <p class="muted">Mande o código para os outros entrarem.</p>
+    </div>
+    <div class="card stack">
+      <div class="code-badge"><span class="muted">código</span><b>${esc(room.code)}</b></div>
+      <div class="row">
+        <button class="btn btn-ghost btn-sm" data-act="copy">${S.copied ? "Convite copiado" : "Copiar convite"}</button>
+        <button class="btn btn-ghost btn-sm" data-act="leave">Sair da sala</button>
+      </div>
+    </div>
+    <div class="grid">
+      ${room.players.map((p, i) => `
+        <div class="note note-empty" style="transform:rotate(${TILTS[i % TILTS.length]}deg);min-height:96px">
+          <div class="who">${p.id === room.hostId ? "anfitrião" : "jogador"}</div>
+          <div class="hand" style="font-size:26px">${esc(p.name)}</div>
+        </div>`).join("")}
+    </div>
+    <p class="tiny">${room.players.length} na sala. Dá pra jogar de 2 a 8 pessoas.</p>
+    ${isHost
+      ? `<button class="btn btn-block" data-act="start" ${room.players.length < 2 ? "disabled" : ""}>Começar o jogo</button>`
+      : `<p class="muted">Esperando ${esc(host ? host.name : "o anfitrião")} começar.</p>`}
+    ${S.error ? `<p class="err">${esc(S.error)}</p>` : ""}`;
+}
+
+function viewAssign(room, me) {
+  const i = room.players.findIndex((p) => p.id === me.id);
+  const target = room.players[(i + room.round) % room.players.length];
+  const done = target && target.character;
+  const missing = room.players.filter((p) => !p.character).map((p) => p.name);
+  return `
+    <div class="stack-sm">
+      <h1 style="font-size:26px">Escolha em segredo</h1>
+      <p class="muted">Rodada ${room.round} · sala ${esc(room.code)}</p>
+    </div>
+    ${done
+      ? `<div class="card stack-sm">
+           <h3>Você já escolheu por ${esc(target.name)}.</h3>
+           <p class="muted">Faltam: ${missing.length ? esc(missing.join(", ")) : "ninguém"}.</p>
+         </div>`
+      : `<div class="card stack">
+           <div class="stack-sm">
+             <h3>Quem <span class="hand" style="font-size:24px">${esc(target ? target.name : "?")}</span> vai ser?</h3>
+             <p class="tiny">Pode ser pessoa real, personagem, animal, o que vocês combinarem.</p>
+           </div>
+           <input class="field" id="f-char" data-draft="char" maxlength="40" placeholder="Ex: Faustão" value="${esc(draft.char)}" />
+           <input class="field" id="f-hint" data-draft="hint" maxlength="28" placeholder="Categoria (opcional): apresentador" value="${esc(draft.hint)}" />
+           <button class="btn btn-block" data-act="assign">Colar na testa dele</button>
+         </div>`}
+    <div class="stack-sm">
+      ${room.players.map((p) => `<p class="muted"><span class="dot ${p.character ? "" : "dot-off"}"></span>${esc(p.name)} ${p.character ? "já recebeu um papel" : "ainda está sem papel"}</p>`).join("")}
+    </div>
+    ${S.error ? `<p class="err">${esc(S.error)}</p>` : ""}`;
+}
+
+function viewPlaying(room, me) {
+  const current = room.players[room.turn] || room.players[0];
+  const myTurn = current && current.id === me.id;
+  const mine = room.players.find((p) => p.id === me.id);
+  const pending = room.pending;
+  const isHost = room.hostId === me.id;
+
+  const cards = room.players.map((p, i) => {
+    const own = p.id === me.id;
+    const tail = p.id === (current && current.id) ? " · na vez" : "";
+    if (own) {
+      return `<div class="note note-empty" style="transform:rotate(${TILTS[i % TILTS.length]}deg)">
+        <div class="who">você${tail}</div>
+        <div class="hand secret">?</div>
+        <p class="tiny">${p.solved ? "você já descobriu" : "só os outros veem isso"}</p>
+      </div>`;
+    }
+    return `<div class="note" style="--paper:${PAPERS[i % PAPERS.length]};transform:rotate(${TILTS[i % TILTS.length]}deg);opacity:${p.solved ? .75 : 1}">
+      <div class="who">${esc(p.name)}${tail}</div>
+      <div class="hand char">${esc(p.character)}</div>
+      ${p.hint ? `<div class="hand hint">${esc(p.hint)}</div>` : ""}
+      ${p.solved ? `<div class="stamp">descobriu no ${p.place}º</div>` : ""}
+    </div>`;
+  }).join("");
+
+  let pendingBlock = "";
+  if (pending && pending.by === me.id) {
+    pendingBlock = `<div class="card stack-sm">
+      <h3>Você chutou: ${esc(pending.text)}</h3>
+      <p class="muted">Esperando alguém confirmar.</p>
+      <button class="btn btn-ghost btn-sm" data-act="cancel-guess">Cancelar chute</button>
+    </div>`;
+  } else if (pending) {
+    pendingBlock = `<div class="card stack">
+      <div class="stack-sm">
+        <h3>${esc(pending.name)} chutou: ${esc(pending.text)}</h3>
+        <p class="muted">Confere o papel dele e responde.</p>
+      </div>
+      <div class="row">
+        <button class="btn btn-yes" data-act="judge-yes">Acertou</button>
+        <button class="btn btn-no" data-act="judge-no">Errou</button>
+      </div>
+    </div>`;
+  }
+
+  let actions = "";
+  if (myTurn && !pending) {
+    if (mine && mine.solved) {
+      actions = `<button class="btn btn-ghost" data-act="pass">Passar a vez</button>`;
+    } else if (S.guessOpen) {
+      actions = `<div class="card stack">
+        <input class="field" id="f-guess" data-draft="guess" maxlength="40" placeholder="Eu sou..." value="${esc(draft.guess)}" />
+        <div class="row">
+          <button class="btn" data-act="send-guess">Enviar chute</button>
+          <button class="btn btn-ghost" data-act="close-guess">Voltar</button>
+        </div>
+      </div>`;
+    } else {
+      actions = `<div class="row">
+        <button class="btn" data-act="open-guess">Vou chutar</button>
+        <button class="btn btn-ghost" data-act="pass">Passar a vez</button>
+      </div>`;
+    }
+  }
+
+  return `
+    <div class="between">
+      <p class="tiny">sala ${esc(room.code)} · rodada ${room.round}</p>
+      <p class="tiny">${room.players.filter((p) => p.solved).length} de ${room.players.length} já se descobriram</p>
+    </div>
+    <div class="turn-card stack-sm">
+      <h2 style="font-size:22px">${myTurn ? "É a sua vez" : "É a vez de " + esc(current ? current.name : "alguém")}</h2>
+      <p class="muted">${myTurn
+        ? "Faça uma pergunta de sim ou não em voz alta. Se a resposta for sim, você pergunta de novo."
+        : "Responda só com sim ou não. Nada de entregar o jogo."}</p>
+    </div>
+    <div class="grid">${cards}</div>
+    ${pendingBlock}
+    ${actions}
+    ${room.log && room.log.length ? `<div class="card">
+      <h3 style="margin-bottom:8px;font-size:16px">O que rolou</h3>
+      <ul class="log">${room.log.slice(-6).reverse().map((e) => `<li>${esc(e.text)}</li>`).join("")}</ul>
+    </div>` : ""}
+    <div class="row">
+      ${isHost ? `<button class="btn btn-ghost btn-sm" data-act="reveal">Encerrar e revelar</button>` : ""}
+      <button class="btn btn-ghost btn-sm" data-act="leave">Sair</button>
+    </div>
+    ${S.error ? `<p class="err">${esc(S.error)}</p>` : ""}`;
+}
+
+function viewEnd(room, me) {
+  const ranking = [...room.players].sort((a, b) => {
+    if (a.solved && b.solved) return a.place - b.place;
+    if (a.solved) return -1;
+    if (b.solved) return 1;
+    return 0;
+  });
+  const isHost = room.hostId === me.id;
+  return `
+    <div class="hero"><div class="note" style="--paper:${PAPERS[1]};transform:rotate(1.5deg)">
+      <div class="hand title">Fim de rodada</div>
+    </div></div>
+    <div class="grid">
+      ${ranking.map((p, i) => `
+        <div class="note" style="--paper:${PAPERS[i % PAPERS.length]};transform:rotate(${TILTS[i % TILTS.length]}deg)">
+          <div class="who">${esc(p.name)}</div>
+          <div class="hand char">${esc(p.character)}</div>
+          <div class="stamp">${p.solved ? "descobriu no " + p.place + "º" : "não descobriu"}</div>
+        </div>`).join("")}
+    </div>
+    ${isHost
+      ? `<button class="btn btn-block" data-act="again">Jogar de novo com os mesmos</button>`
+      : `<p class="muted">Esperando o anfitrião começar outra rodada.</p>`}
+    <button class="btn btn-ghost btn-sm" data-act="leave">Sair da sala</button>
+    ${S.error ? `<p class="err">${esc(S.error)}</p>` : ""}`;
+}
+
+/* ---------- render ---------- */
+function render(force) {
+  let body;
+  if (!db) {
+    body = viewSetup();
+  } else {
+    const room = S.room;
+    const me = S.me;
+    const inRoom = room && me && room.players.some((p) => p.id === me.id);
+    if (!inRoom) body = viewHome();
+    else if (room.phase === "lobby") body = viewLobby(room, me);
+    else if (room.phase === "assign") body = viewAssign(room, me);
+    else if (room.phase === "playing") body = viewPlaying(room, me);
+    else body = viewEnd(room, me);
+  }
+
+  const banner = S.offline ? `<p class="reconnect">Reconectando com a sala...</p>` : "";
+  const html = banner + body;
+  const signature = html + JSON.stringify(draft);
+  if (!force && signature === lastSignature) return;
+  lastSignature = signature;
+
+  const activeId = document.activeElement ? document.activeElement.id : "";
+  app.innerHTML = html;
+  if (activeId) {
+    const el = document.getElementById(activeId);
+    if (el && typeof el.focus === "function") {
+      el.focus();
+      if (typeof el.setSelectionRange === "function" && el.value) {
+        try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) { /* input nao suporta */ }
+      }
+    }
+  }
+}
+
+const ACTIONS = {
+  create: createRoom,
+  join: joinRoom,
+  start: startGame,
+  assign: assignCharacter,
+  pass: passTurn,
+  "open-guess": () => { S.guessOpen = true; render(true); },
+  "close-guess": () => { S.guessOpen = false; render(true); },
+  "send-guess": sendGuess,
+  "cancel-guess": cancelGuess,
+  "judge-yes": () => judge(true),
+  "judge-no": () => judge(false),
+  reveal: revealAll,
+  again: playAgain,
+  leave: leaveRoom,
+  copy: copyInvite
+};
+
+app.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-act]");
+  if (!button || button.disabled) return;
+  const action = ACTIONS[button.getAttribute("data-act")];
+  if (!action) return;
+  S.error = "";
+  Promise.resolve()
+    .then(action)
+    .catch(() => { S.error = "Algo deu errado. Tenta de novo."; render(true); });
+});
+
+app.addEventListener("input", (event) => {
+  const key = event.target.getAttribute("data-draft");
+  if (!key) return;
+  draft[key] = key === "code" ? event.target.value.toUpperCase() : event.target.value;
+  if (key === "code") event.target.value = draft.code;
+});
+
+app.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  const key = event.target.getAttribute("data-draft");
+  if (key === "char" || key === "hint") { event.preventDefault(); assignCharacter(); }
+  if (key === "guess") { event.preventDefault(); sendGuess(); }
+  if (key === "code") { event.preventDefault(); joinRoom(); }
+});
+
+window.addEventListener("error", () => { S.error = "Deu um soluço aqui. A partida continua salva."; render(true); });
+
+/* ---------- boot ---------- */
+(async function boot() {
+  if (FIREBASE_CONFIG && FIREBASE_CONFIG.databaseURL) {
+    try {
+      db = getDatabase(initializeApp(FIREBASE_CONFIG));
+    } catch (e) {
+      db = null;
+    }
+  }
+  const saved = loadMe();
+  if (saved && saved.id) {
+    // Mantem o mesmo id (para o host ser reconhecido se digitar o mesmo codigo de novo),
+    // mas nao reabre a sala nem preenche o nome sozinho: a pessoa sempre comeca do zero.
+    S.me = { id: saved.id, name: "" };
+  }
+  render(true);
+})();</script>
+</body>
+</html>
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#100c2e" />
+<title>Quem sou eu?</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Caveat:wght@600;700&display=swap" rel="stylesheet" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #100c2e; }
+  body {
+    font-family: 'Bricolage Grotesque', ui-sans-serif, system-ui, sans-serif;
+    color: #F2EEFF;
+    background: radial-gradient(130% 85% at 50% -10%, #322a86 0%, #1b1552 42%, #100c2e 100%);
+    background-attachment: fixed;
+    min-height: 100vh;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  #app { max-width: 560px; margin: 0 auto; padding: 26px 16px 56px; display: grid; gap: 14px; align-content: start; }
+  h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: -0.02em; }
+  p { margin: 0; }
+  .muted { color: rgba(242,238,255,.62); font-size: 14px; }
+  .tiny { font-size: 12.5px; color: rgba(242,238,255,.5); }
+  .stack { display: grid; gap: 14px; }
+  .stack-sm { display: grid; gap: 8px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .between { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .hand { font-family: 'Caveat', cursive; font-weight: 700; }
+
+  .note {
+    position: relative; background: var(--paper, #FFE45C); color: #2B2508;
+    border-radius: 3px 3px 5px 5px; padding: 20px 16px 18px;
+    box-shadow: 0 12px 24px rgba(6,4,24,.45);
+  }
+  .note::before {
+    content: ""; position: absolute; top: -10px; left: 50%;
+    width: 76px; height: 20px; transform: translateX(-50%) rotate(-2.5deg);
+    background: rgba(255,255,255,.45);
+    border-left: 1px dashed rgba(0,0,0,.10); border-right: 1px dashed rgba(0,0,0,.10);
+  }
+  .note-empty { background: transparent; color: #F2EEFF; border: 2px dashed rgba(255,255,255,.32); box-shadow: none; }
+  .note-empty::before { background: rgba(255,255,255,.18); }
+
+  .hero { text-align: center; padding: 8px 0 6px; }
+  .hero .note { display: inline-block; padding: 26px 30px 22px; }
+  .hero .title { font-size: 34px; line-height: 1.05; }
+  .hero .sub { font-size: 17px; margin-top: 4px; opacity: .78; }
+
+  .card { background: rgba(255,255,255,.055); border: 1px solid rgba(255,255,255,.12); border-radius: 18px; padding: 18px 16px; }
+  .turn-card { border: 2px dashed rgba(255,228,92,.55); background: rgba(255,228,92,.09); border-radius: 18px; padding: 16px; }
+
+  .field {
+    width: 100%; font: inherit; color: inherit; background: rgba(255,255,255,.07);
+    border: 1.5px solid rgba(255,255,255,.20); border-radius: 13px; padding: 13px 14px;
+  }
+  .field::placeholder { color: rgba(242,238,255,.38); }
+  .field:focus-visible, .btn:focus-visible { outline: 3px solid #FFE45C; outline-offset: 2px; }
+  .code-field { text-transform: uppercase; letter-spacing: .3em; font-weight: 700; text-align: center; }
+  textarea.field { min-height: 96px; resize: vertical; font-size: 13px; letter-spacing: 0; }
+
+  .btn {
+    font: inherit; font-weight: 700; border: none; cursor: pointer; border-radius: 999px;
+    padding: 13px 22px; color: #231C00; background: #FFE45C;
+  }
+  .btn[disabled] { opacity: .42; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: #F2EEFF; border: 1.5px solid rgba(242,238,255,.34); }
+  .btn-yes { background: #86E9A8; }
+  .btn-no { background: #FF9EB1; }
+  .btn-sm { padding: 9px 15px; font-size: 14px; }
+  .btn-block { width: 100%; }
+
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .who { font-size: 13px; font-weight: 700; opacity: .62; margin-bottom: 2px; }
+  .char { font-size: 27px; line-height: 1.1; word-break: break-word; }
+  .hint { font-size: 15px; margin-top: 6px; opacity: .68; }
+  .stamp {
+    display: inline-block; margin-top: 10px; font-size: 12.5px; font-weight: 700;
+    border: 1.5px solid rgba(0,0,0,.35); border-radius: 6px; padding: 2px 8px; transform: rotate(-5deg); opacity: .75;
+  }
+  .secret { font-size: 40px; }
+
+  .code-badge { display: inline-flex; align-items: baseline; gap: 10px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14); border-radius: 14px; padding: 10px 16px; }
+  .code-badge b { font-size: 26px; letter-spacing: .18em; }
+
+  ul.log { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+  ul.log li { font-size: 13.5px; color: rgba(242,238,255,.62); }
+  ul.rules { padding-left: 18px; margin: 0; font-size: 14.5px; color: rgba(242,238,255,.72); }
+  ul.rules li { margin-bottom: 4px; }
+  ol.setup { padding-left: 20px; margin: 0; font-size: 14.5px; color: rgba(242,238,255,.78); }
+  ol.setup li { margin-bottom: 10px; }
+  code { background: rgba(255,255,255,.10); padding: 2px 6px; border-radius: 5px; font-size: 13px; }
+  .err { color: #FFB3B3; font-size: 14px; }
+  .reconnect { font-size: 13px; color: #FFE45C; border: 1px solid rgba(255,228,92,.35); border-radius: 999px; padding: 6px 14px; justify-self: start; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #86E9A8; margin-right: 7px; }
+  .dot-off { background: rgba(255,255,255,.28); }
+  a { color: #FFE45C; }
+  @media (max-width: 380px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div id="app"><p class="muted" style="padding:26px 16px">Carregando o jogo...</p></div>
+
+<script type="module">
+/* ============================================================
+   1. COLE AQUI A CONFIGURACAO DO SEU FIREBASE
+   Console do Firebase > engrenagem > Configuracoes do projeto >
+   Seus apps > App da Web > SDK setup and configuration > Config
+   ============================================================ */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDLph2FYkFfoeTe7VeUULje_SvRs3ut6pk",
+  authDomain: "quem-sou-eu-c6b73.firebaseapp.com",
+  databaseURL: "https://quem-sou-eu-c6b73-default-rtdb.firebaseio.com",
+  projectId: "quem-sou-eu-c6b73",
+  storageBucket: "quem-sou-eu-c6b73.firebasestorage.app",
+  messagingSenderId: "957562256263",
+  appId: "1:957562256263:web:d4ca57ffe01c97f7017122"
+};
+/* ============================================================ */
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getDatabase, ref, onValue, set, get, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
+
+const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PAPERS = ["#FFE45C", "#9CE6A0", "#FFA8C5", "#8FD3FF", "#FFC48C", "#D7B3FF", "#A8F0E6", "#F0DFB6"];
+const TILTS = [-2, 1.6, -1.2, 2.2, -1.8, 1.1, -0.8, 1.9];
+const ME_KEY = "qsr:me";
+
+const app = document.getElementById("app");
+const S = { me: null, code: "", room: null, error: "", busy: false, offline: false, guessOpen: false, copied: false };
+const draft = { name: "", code: "", char: "", hint: "", guess: "", config: "" };
+let db = null;
+let unsubscribe = null;
+let lastSignature = "";
+
+/* ---------- utilidades ---------- */
+const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const randomCode = () => Array.from({ length: 4 }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join("");
+const roomRef = (code) => ref(db, "salas/" + code);
+
+function loadMe() {
+  try { return JSON.parse(localStorage.getItem(ME_KEY) || "null"); } catch (e) { return null; }
+}
+function saveMe(value) {
+  try { localStorage.setItem(ME_KEY, JSON.stringify(value)); } catch (e) { /* modo anonimo */ }
+}
+function normalize(room) {
+  if (!room || !Array.isArray(room.players) || !room.players.length) return null;
+  room.players = room.players.filter(Boolean).map((p) => ({
+    id: p.id, name: p.name || "?", character: p.character || "", hint: p.hint || "",
+    solved: !!p.solved, place: p.place || 0
+  }));
+  room.log = Array.isArray(room.log) ? room.log : [];
+  room.round = room.round || 1;
+  room.pending = room.pending || null;
+  if (typeof room.turn !== "number" || room.turn < 0 || room.turn >= room.players.length) room.turn = 0;
+  return room;
+}
+function pushLog(room, text) {
+  room.log = [...(room.log || []), { t: Date.now(), text }].slice(-14);
+}
+function advanceTurn(room) {
+  const n = room.players.length;
+  for (let step = 1; step <= n; step++) {
+    const idx = (room.turn + step) % n;
+    if (!room.players[idx].solved) { room.turn = idx; return; }
+  }
+  room.phase = "end";
+}
+function fail(message) { S.error = message; render(true); }
+
+async function mutate(mutator) {
+  if (!db || !S.code) return;
+  S.busy = true; S.error = ""; render(true);
+  try {
+    await runTransaction(roomRef(S.code), (current) => {
+      const room = normalize(current);
+      if (!room) return current; // sem cache local ainda: propoe nao mudar nada, o SDK tenta de novo com o dado real do servidor
+      const next = mutator(room);
+      return next || room;
+    });
+  } catch (e) {
+    S.error = "Não consegui falar com a sala. Confere sua internet e tenta de novo.";
+  } finally {
+    S.busy = false; render(true);
+  }
+}
+
+function subscribe(code) {
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  if (!code) return;
   unsubscribe = onValue(
     roomRef(code),
     (snap) => {
